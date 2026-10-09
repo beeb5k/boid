@@ -1,0 +1,28 @@
+# Template file for 'noctalia'
+pkgname=noctalia
+version=5.2.1
+revision=1
+build_style=meson
+configure_args="-Dtests=disabled -Djemalloc=auto"
+
+hostmakedepends="meson ninja pkg-config"
+makedepends="
+ wayland-devel wayland-protocols libepoxy-devel
+ MesaLib-devel libglvnd-devel cairo-devel
+ pango-devel fontconfig-devel freetype-devel
+ harfbuzz-devel libxkbcommon-devel glib-devel
+ libsecret-devel libsodium-devel sdbus-c++-devel
+ pipewire-devel wireplumber-devel polkit-devel
+ pam-devel libcurl-devel libwebp-devel libjxl-devel
+ libsndfile-devel librsvg-devel libqalculate-devel
+ libxml2-devel libmd4c-devel tomlplusplus-devel
+ libical-devel json-c++ stb jemalloc-devel
+"
+
+depends="pipewire wireplumber"
+short_desc="A sleek, customizable desktop shell crafted for Wayland"
+maintainer="Your Name <you@example.com>"
+license="MIT"
+homepage="https://github.com/noctalia-dev/noctalia"
+distfiles="https://github.com/noctalia-dev/noctalia/archive/refs/tags/v${version}.tar.gz"
+checksum="5418f6b759de96e56a4bbca809c5a4c60a8a9594bdf67ecb8c5a341f97c221d1"

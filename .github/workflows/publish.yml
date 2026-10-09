@@ -1,0 +1,244 @@
+name: Build and publish Noctalia
+
+on:
+  schedule:
+    - cron: "17 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noctalia-xbps-repository
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      XBPS_ARCH: x86_64
+
+    permissions:
+      contents: read
+
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      version: ${{ steps.release.outputs.version }}
+      checksum: ${{ steps.release.outputs.checksum }}
+
+    steps:
+      - name: Check out packaging template
+        uses: actions/checkout@v4
+
+      - name: Install build-host utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl jq git xz-utils util-linux \
+            binutils libarchive-tools
+
+      - name: Check upstream release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$(
+            curl -fsSL --retry 3 \
+              https://api.github.com/repos/noctalia-dev/noctalia/releases/latest |
+              jq -er '.tag_name'
+          )"
+
+          case "$tag" in
+            v*) version="${tag#v}" ;;
+            *)
+              echo "Unexpected upstream release tag: $tag" >&2
+              exit 1
+              ;;
+          esac
+
+          current="$(
+            awk -F= '$1 == "version" {print $2; exit}' \
+              srcpkgs/noctalia/template
+          )"
+
+          echo "Latest upstream version: $version"
+          echo "Template version: $current"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          # Scheduled runs skip unchanged releases.
+          # Manual runs also allow the first package publication.
+          if [[ "$version" == "$current" &&
+                "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "No new release; skipping build."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          archive="$RUNNER_TEMP/noctalia.tar.gz"
+
+          curl -fL --retry 3 \
+            "https://github.com/noctalia-dev/noctalia/archive/refs/tags/${tag}.tar.gz" \
+            -o "$archive"
+
+          checksum="$(sha256sum "$archive" | awk '{print $1}')"
+
+          sed -i \
+            -e "s/^version=.*/version=${version}/" \
+            -e "s/^checksum=.*/checksum=\"${checksum}\"/" \
+            srcpkgs/noctalia/template
+
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install static XBPS tools
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+
+          archive="$RUNNER_TEMP/xbps-static.tar.xz"
+
+          curl -fL --retry 3 \
+            https://repo-default.voidlinux.org/static/xbps-static-latest.x86_64-musl.tar.xz \
+            -o "$archive"
+
+          mkdir -p "$RUNNER_TEMP/xbps-static"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/xbps-static"
+
+          echo "$RUNNER_TEMP/xbps-static/usr/bin" >> "$GITHUB_PATH"
+
+      - name: Build the XBPS package
+        if: steps.release.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          builddir="$RUNNER_TEMP/void-packages"
+
+          git clone --depth=1 \
+            https://github.com/void-linux/void-packages.git \
+            "$builddir"
+
+          mkdir -p "$builddir/srcpkgs/noctalia"
+          cp srcpkgs/noctalia/template \
+            "$builddir/srcpkgs/noctalia/template"
+
+          cd "$builddir"
+
+          ./xbps-src binary-bootstrap
+          ./xbps-src pkg noctalia
+
+          package="$(
+            find "$builddir/hostdir/binpkgs" \
+              -type f \
+              -name "noctalia-${VERSION}_*.x86_64.xbps" \
+              -print -quit
+          )"
+
+          if [[ -z "$package" ]]; then
+            echo "No Noctalia package was produced." >&2
+            exit 1
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/public/repo"
+          cp "$package" "$GITHUB_WORKSPACE/public/repo/"
+
+          printf '%s\n' \
+            'Noctalia XBPS repository' \
+            > "$GITHUB_WORKSPACE/public/index.html"
+
+          printf '%s\n' \
+            'Noctalia package repository' \
+            > "$GITHUB_WORKSPACE/public/repo/index.html"
+
+          touch "$GITHUB_WORKSPACE/public/.nojekyll"
+
+      - name: Sign repository and package
+        if: steps.release.outputs.publish == 'true'
+        env:
+          XBPS_PRIVATE_KEY_B64: ${{ secrets.XBPS_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$XBPS_PRIVATE_KEY_B64" ]]; then
+            echo "Missing XBPS_PRIVATE_KEY_B64 secret." >&2
+            exit 1
+          fi
+
+          repo="$GITHUB_WORKSPACE/public/repo"
+          key="$RUNNER_TEMP/noctalia-repo.pem"
+
+          printf '%s' "$XBPS_PRIVATE_KEY_B64" |
+            base64 --decode > "$key"
+
+          chmod 600 "$key"
+
+          xbps-rindex -a "$repo"/*.xbps
+
+          xbps-rindex \
+            --privkey "$key" \
+            --sign \
+            --signedby "Noctalia XBPS Repository" \
+            "$repo"
+
+          xbps-rindex \
+            --privkey "$key" \
+            --sign-pkg \
+            "$repo"/*.xbps
+
+      - name: Upload repository for deployment
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out packaging template
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Save the successfully published version
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          CHECKSUM: ${{ needs.build.outputs.checksum }}
+        run: |
+          set -euo pipefail
+
+          sed -i \
+            -e "s/^version=.*/version=${VERSION}/" \
+            -e "s/^checksum=.*/checksum=\"${CHECKSUM}\"/" \
+            srcpkgs/noctalia/template
+
+          if git diff --quiet -- srcpkgs/noctalia/template; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add srcpkgs/noctalia/template
+          git commit -m "Update Noctalia to ${VERSION}"
+          git push
